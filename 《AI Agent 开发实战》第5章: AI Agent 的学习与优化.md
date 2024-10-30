@@ -728,4 +728,374 @@ class EWC(nn.Module):
         fisher = {n: torch.zeros(p.shape).to(device) for n, p in self.model.named_parameters() if p.requires_grad}
         for input, target in data_loader:
             input, target = input.to(device), target.to(device)
-            self.model
+            self.model.zero_grad()
+            output = self.model(input)
+            loss = F.nll_loss(F.log_softmax(output, dim=1), target)
+            loss.backward()
+            
+            for n, p in self.model.named_parameters():
+                if p.requires_grad:
+                    fisher[n] += p.grad.data.pow(2) / self.fisher_estimation_sample_size
+        
+        fisher = {n: p / self.fisher_estimation_sample_size for n, p in fisher.items()}
+        return fisher
+    
+    def ewc_loss(self, cuda=False):
+        if not hasattr(self, 'fisher'):
+            return 0
+        loss = 0
+        for n, p in self.model.named_parameters():
+            if p.requires_grad:
+                _loss = (self.fisher[n] * (p - self.star_vars[n]).pow(2)).sum()
+                loss += _loss
+        return loss
+
+class LifelongLearningAgent:
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        self.model = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        self.ewc = EWC(self.model, fisher_estimation_sample_size=200)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            q_values = self.model(state)
+        return q_values.max(1)[1].item()
+
+    def update(self, state, action, reward, next_state, done):
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+        action = torch.LongTensor([action]).to(self.device)
+        reward = torch.FloatTensor([reward]).to(self.device)
+        done = torch.FloatTensor([done]).to(self.device)
+
+        q_values = self.model(state)
+        next_q_values = self.model(next_state)
+        q_value = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+        next_q_value = next_q_values.max(1)[0]
+        expected_q_value = reward + 0.99 * next_q_value * (1 - done)
+
+        loss = F.mse_loss(q_value, expected_q_value.detach())
+        ewc_loss = self.ewc.ewc_loss()
+        total_loss = loss + 100 * ewc_loss  # EWC loss weight
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+    def learn_task(self, env, num_episodes):
+        for episode in range(num_episodes):
+            state = env.reset()
+            total_reward = 0
+            done = False
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, done, _ = env.step(action)
+                self.update(state, action, reward, next_state, done)
+                state = next_state
+                total_reward += reward
+            if episode % 10 == 0:
+                print(f"Episode {episode}, Total Reward: {total_reward}")
+        
+        # 更新 Fisher 信息和参数快照
+        self.ewc.fisher = self.ewc.estimate_fisher(env, self.device)
+        self.ewc.star_vars = {n: p.data.clone() for n, p in self.model.named_parameters() if p.requires_grad}
+
+# 创建环境和Agent
+env1 = gym.make('CartPole-v1')
+env2 = gym.make('Acrobot-v1')
+state_dim = max(env1.observation_space.shape[0], env2.observation_space.shape[0])
+action_dim = max(env1.action_space.n, env2.action_space.n)
+agent = LifelongLearningAgent(state_dim, action_dim)
+
+# 学习第一个任务
+print("Learning CartPole task...")
+agent.learn_task(env1, num_episodes=200)
+
+# 学习第二个任务
+print("\nLearning Acrobot task...")
+agent.learn_task(env2, num_episodes=200)
+
+# 测试在两个任务上的表现
+print("\nTesting on CartPole...")
+env1 = gym.make('CartPole-v1')
+for _ in range(10):
+    state = env1.reset()
+    total_reward = 0
+    done = False
+    while not done:
+        action = agent.select_action(state)
+        state, reward, done, _ = env1.step(action)
+        total_reward += reward
+    print(f"CartPole Total Reward: {total_reward}")
+
+print("\nTesting on Acrobot...")
+env2 = gym.make('Acrobot-v1')
+for _ in range(10):
+    state = env2.reset()
+    total_reward = 0
+    done = False
+    while not done:
+        action = agent.select_action(state)
+        state, reward, done, _ = env2.step(action)
+        total_reward += reward
+    print(f"Acrobot Total Reward: {total_reward}")
+
+env1.close()
+env2.close()
+```
+
+## 5.4 多智能体强化学习
+
+多智能体强化学习（MARL）涉及多个Agent在同一环境中学习和交互。这种设置可以模拟更复杂的现实世界场景，如交通系统、经济市场等。
+
+### 5.4.1 多智能体马尔可夫决策过程
+
+多智能体马尔可夫决策过程（MMDP）是单Agent MDP的扩展，用于描述多Agent环境。
+
+关键概念：
+1. 联合动作空间
+2. 全局状态和局部观察
+3. 奖励分配机制
+
+### 5.4.2 分散式强化学习
+
+分散式强化学习允许每个Agent独立学习其策略，而不需要访问全局信息。
+
+关键方法：
+1. 独立Q学习
+2. 分散式演员-评论员（Decentralized Actor-Critic）
+
+代码示例：使用独立Q学习的简单多Agent系统
+```python
+import numpy as np
+import gym
+import ma_gym
+
+class IndependentQLearningAgent:
+    def __init__(self, state_size, action_size, learning_rate=0.1, discount_factor=0.95, epsilon=0.1):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.epsilon = epsilon
+        self.q_table = np.zeros((state_size, action_size))
+
+    def get_action(self, state):
+        if np.random.random() < self.epsilon:
+            return np.random.randint(self.action_size)
+        else:
+            return np.argmax(self.q_table[state])
+
+    def update(self, state, action, reward, next_state):
+        current_q = self.q_table[state, action]
+        max_next_q = np.max(self.q_table[next_state])
+        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
+        self.q_table[state, action] = new_q
+
+# 创建环境
+env = gym.make('ma_gym:PredatorPrey5x5-v0')
+
+# 创建Agent
+n_agents = env.n_agents
+agents = [IndependentQLearningAgent(env.observation_space[0].n, env.action_space[0].n) for _ in range(n_agents)]
+
+# 训练循环
+n_episodes = 10000
+for episode in range(n_episodes):
+    states = env.reset()
+    total_reward = 0
+    done = False
+
+    while not done:
+        actions = [agent.get_action(state) for agent, state in zip(agents, states)]
+        next_states, rewards, dones, _ = env.step(actions)
+        total_reward += sum(rewards)
+
+        for agent, state, action, reward, next_state in zip(agents, states, actions, rewards, next_states):
+            agent.update(state, action, reward, next_state)
+
+        states = next_states
+        done = all(dones)
+
+    if episode % 100 == 0:
+        print(f"Episode {episode}, Total Reward: {total_reward}")
+
+# 测试训练好的Agents
+n_test_episodes = 100
+total_test_reward = 0
+
+for _ in range(n_test_episodes):
+    states = env.reset()
+    episode_reward = 0
+    done = False
+
+    while not done:
+        actions = [agent.get_action(state) for agent, state in zip(agents, states)]
+        states, rewards, dones, _ = env.step(actions)
+        episode_reward += sum(rewards)
+        done = all(dones)
+
+    total_test_reward += episode_reward
+
+average_test_reward = total_test_reward / n_test_episodes
+print(f"Average Test Reward: {average_test_reward}")
+
+env.close()
+```
+
+### 5.4.3 协作探索策略
+
+在多Agent环境中，协作探索可以帮助Agents更有效地学习。这涉及设计策略来鼓励Agents共同探索环境，而不是各自为政。
+
+关键技术：
+1. 内在激励机制
+2. 通信协议
+3. 共享经验池
+
+代码示例：使用共享经验池的多Agent DQN
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import gym
+import ma_gym
+from collections import deque
+import random
+
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+class SharedExperienceAgent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=10000)
+        self.gamma = 0.95    # discount factor
+        self.epsilon = 1.0   # exploration rate
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.001
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = DQN(state_size, action_size).to(self.device)
+        self.target_model = DQN(state_size, action_size).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        act_values = self.model(state)
+        return np.argmax(act_values.cpu().data.numpy())
+
+    def replay(self, batch_size):
+        minibatch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*minibatch)
+
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.LongTensor(actions).to(self.device)
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
+
+        current_q_values = self.model(states).gather(1, actions.unsqueeze(1))
+        next_q_values = self.target_model(next_states).max(1)[0].detach()
+        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+
+        loss = nn.MSELoss()(current_q_values, target_q_values.unsqueeze(1))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+# 创建环境
+env = gym.make('ma_gym:PredatorPrey5x5-v0')
+
+# 创建Agents
+n_agents = env.n_agents
+state_size = env.observation_space[0].shape[0]
+action_size = env.action_space[0].n
+agents = [SharedExperienceAgent(state_size, action_size) for _ in range(n_agents)]
+
+# 训练循环
+n_episodes = 1000
+batch_size = 32
+
+for episode in range(n_episodes):
+    states = env.reset()
+    total_reward = 0
+    done = False
+
+    while not done:
+        actions = [agent.act(state) for agent, state in zip(agents, states)]
+        next_states, rewards, dones, _ = env.step(actions)
+        total_reward += sum(rewards)
+
+        for agent, state, action, reward, next_state, done in zip(agents, states, actions, rewards, next_states, dones):
+            agent.remember(state, action, reward, next_state, done)
+
+        states = next_states
+        done = all(dones)
+
+        # 所有Agent共享经验并学习
+        if len(agents[0].memory) > batch_size:
+            for agent in agents:
+                agent.replay(batch_size)
+
+    if episode % 10 == 0:
+        for agent in agents:
+            agent.update_target_model()
+        print(f"Episode {episode}, Total Reward: {total_reward}")
+
+# 测试训练好的Agents
+n_test_episodes = 100
+total_test_reward = 0
+
+for _ in range(n_test_episodes):
+    states = env.reset()
+    episode_reward = 0
+    done = False
+
+    while not done:
+        actions = [agent.act(state) for agent, state in zip(agents, states)]
+        states, rewards, dones, _ = env.step(actions)
+        episode_reward += sum(rewards)
+        done = all(dones)
+
+    total_test_reward += episode_reward
+
+average_test_reward = total_test_reward / n_test_episodes
+print(f"Average Test Reward: {average_test_reward}")
+
+env.close()
+```
+
+这些多智能体强化学习方法为处理复杂的多Agent系统提供了强大的工具。在实际应用中，我们需要根据具体问题的特性选择合适的算法，并考虑Agent之间的协作和竞争关系。
+
+通过本章，我们深入探讨了AI Agent的学习与优化技术，包括强化学习、进化算法、元学习和多智能体学习。这些方法为开发高性能、适应性强的AI Agent提供了丰富的工具和思路。在接下来的章节中，我们将探讨如何将这些技术应用到实际的AI Agent开发项目中。
